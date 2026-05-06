@@ -1207,6 +1207,81 @@ def serial_reset(slot: dict) -> dict:
     return {"ok": True, "output": lines}
 
 
+def flash_device(slot: dict, files: dict, esptool_args: list[str],
+                 timeout_s: float = 300.0) -> dict:
+    """Flash a device on *slot* via esptool.
+
+    Stops the RFC2217 proxy so esptool can claim the local devnode, writes
+    the uploaded *files* (basename → bytes) into a temp dir, runs esptool
+    with *esptool_args* (any token equal to a basename is rewritten to its
+    temp path), then restarts the proxy.
+
+    Returns {"ok": bool, "output": str, "returncode": int, "error": str?}.
+    """
+    import tempfile
+
+    label = slot["label"]
+    devnode = slot.get("devnode")
+
+    if not devnode:
+        return {"ok": False, "error": f"{label}: no device node"}
+    if not slot.get("present"):
+        return {"ok": False, "error": f"{label}: device not present"}
+
+    # Stop the proxy so esptool can open the local serial port directly
+    with slot["_lock"]:
+        was_running = bool(slot.get("running"))
+        if was_running:
+            stop_proxy(slot)
+        slot["state"] = STATE_RESETTING
+
+    output_text = ""
+    returncode = -1
+    error = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="wb-flash-") as tmpdir:
+            paths = {}
+            for name, data in files.items():
+                if "/" in name or ".." in name:
+                    error = f"invalid filename: {name}"
+                    break
+                p = os.path.join(tmpdir, name)
+                with open(p, "wb") as f:
+                    f.write(data)
+                paths[name] = p
+            if not error:
+                resolved = [paths.get(a, a) for a in esptool_args]
+                cmd = ["esptool.py", "--port", devnode] + resolved
+                log_activity(f"flash({label}) — {' '.join(cmd[:6])} ...", "step")
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout_s,
+                )
+                output_text = (proc.stdout or "") + (proc.stderr or "")
+                returncode = proc.returncode
+                if returncode != 0:
+                    error = f"esptool exited {returncode}"
+    except subprocess.TimeoutExpired:
+        error = f"esptool timed out after {timeout_s}s"
+    except Exception as e:
+        error = f"flash failed: {e}"
+    finally:
+        # Restart the proxy on the same devnode (DTR/RTS reset doesn't cause
+        # USB re-enumeration — same handling as serial_reset).
+        time.sleep(NATIVE_USB_BOOT_DELAY_S)
+        with slot["_lock"]:
+            if was_running and not slot.get("running"):
+                start_proxy(slot)
+            if slot["state"] == STATE_RESETTING:
+                slot["state"] = STATE_IDLE if slot["present"] else STATE_ABSENT
+
+    if error:
+        log_activity(f"flash({label}) — failed: {error}", "error")
+        return {"ok": False, "error": error,
+                "output": output_text, "returncode": returncode}
+    log_activity(f"flash({label}) — ok ({len(output_text)} bytes output)", "ok")
+    return {"ok": True, "output": output_text, "returncode": returncode}
+
+
 def serial_monitor(slot: dict, pattern: str | None = None,
                    timeout: float = 10.0) -> dict:
     """FR-009: Read serial output via RFC2217 proxy.
@@ -1640,6 +1715,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_siggen_atten()
         elif path == "/api/firmware/upload":
             self._handle_firmware_upload()
+        elif path == "/api/flash":
+            self._handle_flash()
         elif path == "/api/ble/scan":
             self._handle_ble_scan()
         elif path == "/api/ble/connect":
@@ -2588,6 +2665,171 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f.write(file_data)
         log_activity(f"firmware.upload({project}/{file_name}, {len(file_data)} bytes)", "ok")
         self._send_json({"ok": True, "project": project, "filename": file_name, "size": len(file_data)})
+
+    def _handle_flash(self):
+        """POST /api/flash — multipart upload + esptool flash on a slot.
+
+        Form fields:
+          slot       — slot label (e.g. "SLOT3"), required
+          chip       — esp32, esp32s3, esp32c3, ... (default "auto")
+          baud       — esptool baud (default "921600")
+          flash_mode — dio/qio/... (default "dio", overridden by flash_args)
+          flash_freq — 40m/80m/... (default "40m", overridden by flash_args)
+          flash_size — 4MB/keep/... (default "keep", overridden by flash_args)
+          erase      — "1"/"true" to erase whole flash before write (default off)
+
+        Files (one of):
+          • A `flash_args` text part (esptool's @flash_args format) plus the
+            referenced .bin files (each as its own multipart part, name=
+            <basename>, filename=<basename>). This is exactly what
+            ESP-IDF emits in build/flash_args.
+          • One or more parts named `bin@<offset>` (e.g. "bin@0x10000"),
+            content = the binary, written at that offset.
+        """
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self._send_json({"ok": False, "error": "expected multipart/form-data"}, 400)
+            return
+        boundary = None
+        for part in content_type.split(";"):
+            part = part.strip()
+            if part.startswith("boundary="):
+                boundary = part[9:].strip('"')
+        if not boundary:
+            self._send_json({"ok": False, "error": "missing boundary"}, 400)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            self._send_json({"ok": False, "error": "empty body"}, 400)
+            return
+        body = self.rfile.read(length)
+        boundary_bytes = boundary.encode()
+        parts_raw = body.split(b"--" + boundary_bytes)
+
+        fields: dict[str, str] = {}
+        files: dict[str, bytes] = {}
+        offset_files: list[tuple[str, str]] = []
+        flash_args_text: str | None = None
+
+        for part in parts_raw:
+            part = part.strip()
+            if not part or part == b"--":
+                continue
+            if b"\r\n\r\n" in part:
+                header_section, content = part.split(b"\r\n\r\n", 1)
+            elif b"\n\n" in part:
+                header_section, content = part.split(b"\n\n", 1)
+            else:
+                continue
+            headers_text = header_section.decode("utf-8", errors="replace")
+            if content.endswith(b"\r\n"):
+                content = content[:-2]
+            name = None
+            filename = None
+            for h in headers_text.split("\n"):
+                h = h.strip()
+                if h.lower().startswith("content-disposition"):
+                    for tok in h.split(";"):
+                        tok = tok.strip()
+                        if tok.startswith("name="):
+                            name = tok[5:].strip().strip('"').strip("'")
+                        elif tok.startswith("filename="):
+                            filename = tok[9:].strip().strip('"').strip("'")
+            if name is None:
+                continue
+            if filename is not None:
+                if "/" in filename or ".." in filename:
+                    self._send_json({"ok": False, "error": f"path traversal: {filename}"}, 400)
+                    return
+                if name == "flash_args":
+                    flash_args_text = content.decode("utf-8", errors="replace")
+                elif name.startswith("bin@"):
+                    offset = name[4:]
+                    try:
+                        int(offset, 0)  # validates 0x... or decimal
+                    except ValueError:
+                        self._send_json({"ok": False, "error": f"invalid offset in '{name}'"}, 400)
+                        return
+                    offset_files.append((offset, filename))
+                    files[filename] = content
+                else:
+                    files[filename] = content
+            else:
+                fields[name] = content.decode("utf-8", errors="replace").strip()
+
+        slot_label = fields.get("slot")
+        if not slot_label:
+            self._send_json({"ok": False, "error": "missing 'slot' field"}, 400)
+            return
+        slot = _find_slot_by_label(slot_label)
+        if not slot:
+            self._send_json({"ok": False, "error": f"slot '{slot_label}' not found"}, 404)
+            return
+        if not slot.get("present"):
+            self._send_json({"ok": False, "error": f"slot '{slot_label}' has no device"}, 400)
+            return
+
+        chip = fields.get("chip", "auto")
+        baud = fields.get("baud", "921600")
+        flash_mode = fields.get("flash_mode", "dio")
+        flash_freq = fields.get("flash_freq", "40m")
+        flash_size = fields.get("flash_size", "keep")
+        erase = fields.get("erase", "").lower() in ("1", "true", "yes", "on")
+
+        # Resolve offset/file pairs from flash_args (if any) and bin@... parts.
+        flash_pairs: list[tuple[str, str]] = []
+        if flash_args_text:
+            for line in flash_args_text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                tokens = line.split()
+                if tokens[0].startswith("--"):
+                    if tokens[0] in ("--flash_mode", "--flash-mode") and len(tokens) > 1:
+                        flash_mode = tokens[1]
+                    elif tokens[0] in ("--flash_freq", "--flash-freq") and len(tokens) > 1:
+                        flash_freq = tokens[1]
+                    elif tokens[0] in ("--flash_size", "--flash-size") and len(tokens) > 1:
+                        flash_size = tokens[1]
+                    continue
+                if len(tokens) >= 2:
+                    try:
+                        int(tokens[0], 0)
+                    except ValueError:
+                        continue
+                    base = os.path.basename(tokens[1])
+                    if base not in files:
+                        self._send_json(
+                            {"ok": False,
+                             "error": f"flash_args references '{base}' but it was not uploaded"},
+                            400,
+                        )
+                        return
+                    flash_pairs.append((tokens[0], base))
+        flash_pairs.extend(offset_files)
+        if not flash_pairs:
+            self._send_json({"ok": False, "error": "no binaries to flash"}, 400)
+            return
+
+        base_args = [
+            "--chip", chip,
+            "--baud", baud,
+            "--before", "default_reset",
+            "--after", "hard_reset",
+        ]
+        write_args = [
+            "write_flash",
+            "--flash_mode", flash_mode,
+            "--flash_freq", flash_freq,
+            "--flash_size", flash_size,
+        ]
+        if erase:
+            write_args.append("--erase-all")
+        for offset, base in flash_pairs:
+            write_args.extend([offset, base])
+
+        result = flash_device(slot, files, base_args + write_args)
+        self._send_json(result, 200 if result.get("ok") else 500)
 
     def _handle_firmware_delete(self):
         body = self._read_json()

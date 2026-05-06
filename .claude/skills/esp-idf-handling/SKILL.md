@@ -119,23 +119,60 @@ Response fields per slot: `label`, `state`, `url` (RFC2217, auto-assigned port),
 
 ### Flash via RFC2217
 
-Flashing uses esptool from the host through the RFC2217 proxy. Binaries
-stay on the host — no SCP needed. Use `--after no-reset` to avoid USB
-re-enumeration, then reboot via the API.
-
 **Bootloader offsets:** Classic ESP32 → `0x1000`, all newer chips (C3/S3/C6/H2) → `0x0000`.
 
-```bash
-# Get the RFC2217 URL
-SLOT_URL=$(curl -s http://workbench.local:8080/api/devices | jq -r '.slots[0].url')
+#### Preferred: `POST /api/flash` (Pi-side esptool)
 
-# Flash (binaries stay on host)
+The portal stops the proxy, runs esptool directly on the Pi against the
+local devnode, then restarts the proxy. Use this whenever your client is
+not on the same LAN as the workbench — RFC2217's SET_CONTROL roundtrip is
+too slow to keep the auto-reset window open from a high-latency path.
+
+**Multipart with ESP-IDF `flash_args`** (recommended — uses what the build
+already produces):
+
+```bash
+cd build
+curl -s -X POST http://workbench.local:8080/api/flash \
+  -F slot=SLOT1 -F chip=esp32 -F baud=921600 \
+  -F flash_args=@flash_args \
+  -F bootloader.bin=@bootloader/bootloader.bin \
+  -F partition-table.bin=@partition_table/partition-table.bin \
+  -F ota_data_initial.bin=@ota_data_initial.bin \
+  -F firmware.bin=@firmware.bin \
+  | jq .
+```
+
+Each .bin file's multipart **part name must equal its basename** as
+referenced by `flash_args` (e.g. `bootloader.bin`).
+
+**Multipart with explicit offsets** (no `flash_args`; use for one-off
+single-binary flashes):
+
+```bash
+curl -s -X POST http://workbench.local:8080/api/flash \
+  -F slot=SLOT1 -F chip=esp32c3 \
+  -F 'bin@0x0000=@bootloader.bin' \
+  -F 'bin@0x8000=@partition-table.bin' \
+  -F 'bin@0x10000=@firmware.bin'
+```
+
+Optional form fields: `flash_mode` (default `dio`), `flash_freq` (`40m`),
+`flash_size` (`keep`), `erase=1` to erase whole flash before writing.
+Response: `{"ok": ..., "output": "<esptool stdout+stderr>", "returncode": N}`.
+
+#### Fallback: direct esptool over RFC2217
+
+Only viable when your client is on the same LAN as the workbench
+(sub-millisecond RTT). Slow paths break the auto-reset timing window
+because each pyserial `SET_CONTROL` is a network roundtrip.
+
+```bash
+SLOT_URL=$(curl -s http://workbench.local:8080/api/devices | jq -r '.slots[0].url')
 esptool --port "$SLOT_URL" --chip esp32c3 \
   --before default-reset --after no-reset \
   write-flash --flash-mode dio --flash-size 4MB \
   0x0000 bootloader.bin 0x8000 partition-table.bin 0x10000 firmware.bin
-
-# Reboot device into new firmware
 curl -X POST http://workbench.local:8080/api/serial/reset \
   -H "Content-Type: application/json" -d '{"slot":"SLOT1"}'
 ```
@@ -146,6 +183,7 @@ curl -X POST http://workbench.local:8080/api/serial/reset \
 |--------|------|---------|
 | GET | `/api/devices` | List all slots with state, device node, RFC2217 URL |
 | GET | `/api/info` | System info (host IP, hostname, slot counts) |
+| POST | `/api/flash` | Multipart upload + esptool flash on a slot (Pi-side) |
 | POST | `/api/serial/reset` | Hardware reset via DTR/RTS pulse, returns boot output |
 | POST | `/api/serial/recover` | Manual flap recovery trigger `{"slot": "slot-1"}` |
 | POST | `/api/serial/release` | Release GPIO after flashing, reboot into firmware `{"slot": "slot-1"}` |
