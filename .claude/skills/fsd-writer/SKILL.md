@@ -1,12 +1,13 @@
 ---
 name: fsd-writer
 description: >
-  Generates or updates a Functional Specification Document (FSD), mainly
-  for ESP32 projects. Converts rough project descriptions into structured FSDs with
-  requirements, test cases, and traceability. Supports initial generation
-  and incremental evolution. Triggers on "FSD", "fsd", "write FSD",
-  "create FSD", "generate FSD", "new FSD", "update FSD", "evolve FSD",
-  "functional spec", "specification document".
+  Generates or updates a Functional Specification Document (FSD) for any kind of
+  system — embedded, cloud back-end, mobile, networking, SDR, or hybrid. Converts
+  rough project descriptions into structured FSDs with requirements, test cases,
+  and traceability. Supports initial generation and incremental evolution, and
+  loads optional domain packs (e.g. ESP32) for domain-specific detection and test
+  libraries. Triggers on "FSD", "fsd", "write FSD", "create FSD", "generate FSD",
+  "new FSD", "update FSD", "evolve FSD", "functional spec", "specification document".
 ---
 
 # FSD Writer Skill
@@ -201,8 +202,9 @@ answerable from project artefacts:
 
 - Read config files: `sdkconfig.defaults`, `platformio.ini`, `package.json`,
   `Cargo.toml`, `CMakeLists.txt`, `docker-compose.yml`.
-- Grep for protocol/framework usage in source (BLE, WiFi, MQTT, HTTP, OTA,
-  USB HID, NVS, watchdog — see the detection patterns in Section 14).
+- Grep for protocol/framework usage in source (HTTP/REST, gRPC, WebSocket,
+  message queues, DB/auth SDKs, BLE/WiFi, etc.) and check whether a domain pack
+  matches (Section 14) for domain-specific detection patterns.
 - Read `README.md`, `CLAUDE.md`, and any existing FSD or design docs.
 
 If the answer is in the codebase, **explore — do not ask the user**. Asking
@@ -235,9 +237,9 @@ Given the rough description, the skill must extract or infer the following:
 ### 6.1 Project Name
 
 Derive a short, descriptive name:
-- "ESP32 BLE HID Keyboard"
-- "Solar-Aware EV Charging Controller"
-- "LoRa Mailbox Notifier"
+- "ESP32 BLE HID Keyboard" (embedded)
+- "Multi-Tenant Billing API" (cloud back-end)
+- "Offline-First Notes App" (mobile)
 
 ### 6.2 System Purpose & Goals
 
@@ -315,6 +317,27 @@ From extracted requirements:
 - Use structured format: Objective, Preconditions, Steps, Expected Result
 - Build the traceability matrix (Section 8)
 
+### 6.10 Component Layering & Test Architecture
+
+Give every FSD a layered component architecture (§2.4) that the test strategy
+falls out of (§8.0):
+
+- Classify each component into a layer with a strict one-way dependency —
+  **L0 Foundation/platform → L1 Interfaces → L2 Application logic**. The L0-vs-L1
+  line is **ownership** ("did we implement and test the protocol?"): a
+  library/managed client to an external service is foundation; a hand-written
+  decoder/driver/handler is an interface.
+- Draw a layered component diagram in §2.4 (stacked layer boxes, components on one
+  row per layer).
+- In §8.0, define the test tiers (cost-ordered execution environments, named per
+  platform), map them to the layers, and reference a **generated** component × tier
+  coverage matrix. This skill declares the structure; a traceability tool fills in
+  status.
+
+Platform-independent — contents differ for embedded / cloud / mobile. For the
+profiles, the diagram convention (and the Mermaid layout gotcha), and the matrix,
+read `references/test-architecture.md`.
+
 ## 7. Canonical FSD Structure
 
 All generated or updated FSDs must conform to the canonical structure (Sections 1-11: System Overview, Architecture, Phases, Requirements, Risks, Interfaces, Operational Procedures, V&V, Troubleshooting, Appendix, Related). Section 11 is recommended (not mandatory): a list of `[[wikilinks]]` to related FSDs/ADRs/runbooks for Obsidian-vault navigation. For the full template with all subsections and section inclusion rules, read `references/canonical-fsd-structure.md`.
@@ -358,8 +381,8 @@ Create the `Documents/` directory if it does not exist.
 
 Examples:
 - `Documents/esp32-ble-hid-keyboard-fsd.md`
-- `Documents/solar-ev-charging-controller-fsd.md`
-- `Documents/lora-mailbox-notifier-fsd.md`
+- `Documents/multi-tenant-billing-api-fsd.md`
+- `Documents/offline-first-notes-app-fsd.md`
 
 ### 10.2 Explicit Path
 
@@ -387,51 +410,40 @@ After generating or updating an FSD, the skill must verify:
 - [ ] No `<placeholder>` or `TODO` text remains (flag to user if unresolvable).
 - [ ] Section numbering is sequential with no gaps.
 - [ ] All phases have scope, deliverables, and exit criteria.
+- [ ] §2.4 Component Layering (with a layered diagram) and §8.0 Test Architecture are present.
 - [ ] The file has been written to the correct path.
 - [ ] (Evolve mode) Unaffected sections are identical to the original.
 
 Report any checklist failures to the user before finalizing.
 
-## 14. Standard Test Libraries
+## 14. Domain Packs
 
-Include standard test cases in the FSD based on detected project features.
-Tests are conditionally included — scan the FSD and source code for detection
-patterns, then pull in the matching test specs from `references/`.
+The skill core is **domain-neutral**. Some domains have recurring components,
+detection signals, layer profiles, and standard test libraries; these live in
+**domain packs** under `references/domains/<domain>.md` and are loaded only when
+the project matches that domain — keeping the core applicable to any system.
 
-### Feature Detection
+### Selecting a pack
 
-| Feature | Detection Patterns | Test Spec | Include |
-|---------|-------------------|-----------|---------|
-| **WiFi STA** | `WiFi.begin`, `esp_wifi_connect`, "STA mode" | `wifi-test-spec.md` | WIFI-001–005, EC-100–101, EC-110–111, EC-115 |
-| **Captive Portal** | `WiFi.softAP`, "captive portal", "AP mode" | `captive-portal-test-spec.md` | AP-001–006, CP-001–006, TC-CP-100–102 |
-| **MQTT** | `PubSubClient`, `esp_mqtt`, "MQTT broker" | `mqtt-test-spec.md` | MQTT-001–031, TC-MQTT-100–103 |
-| **BLE** | `NimBLE`, `esp_ble`, `BLEDevice`, "BLE", "GATT" | `ble-test-spec.md` | BLE-001–032, TC-BLE-100–103 |
-| **BLE NUS** | `NUS`, `6E400001`, "Nordic UART" | `ble-test-spec.md` | BLE-020–023, TC-BLE-101 |
-| **OTA** | `esp_ota`, `httpUpdate`, "firmware update", "OTA" | `ota-test-spec.md` | OTA-001–013, TC-OTA-100–102 |
-| **USB HID** | `tinyusb`, `tusb_`, "HID", "keyboard", "USB device" | `usb-hid-test-spec.md` | HID-001–022, TC-HID-100–103 |
-| **NVS** | `Preferences`, `nvs_`, "NVS", "stored credentials" | `nvs-test-spec.md` | NVS-001–024, TC-NVS-100–103 |
-| **Watchdog** | `esp_task_wdt`, `TWDT`, "watchdog" | `watchdog-test-spec.md` | WDT-001–022, TC-WDT-100–102 |
-| **Logging** | `ESP_LOG`, `udp_log`, "UDP logging", "serial log" | `logging-test-spec.md` | LOG-001–026, TC-LOG-100–103 |
-| **Ethernet** | `W5500`, `ETH.begin`, "dual network" | `wifi-test-spec.md` | TEST-001–005, EC-100 |
+1. Detect the domain from the description, the codebase, and config files (each
+   pack lists its own detection signals).
+2. If a pack matches, **read `references/domains/<domain>.md`** and apply it:
+   its **layer profile** (concrete L0/L1/L2 contents for §2.4), its **tier names**
+   (for §8.0), and its **standard test libraries** (feature detection → test specs
+   to fold into §8 and the traceability matrix).
+3. If no pack matches, use the platform-independent core only — the architecture
+   layering and test tiers from `references/test-architecture.md` still apply; pick
+   tier names that fit the platform (e.g. cloud: unit / integration / staging).
 
-### Workflow
+### Available packs
 
-1. Scan the FSD requirements and source code for detection patterns above
-2. For each detected feature, read the corresponding `references/*.md` file
-3. Copy relevant requirements, functional tests, and edge cases into the FSD
-4. Update project-specific placeholders (SSIDs, IPs, timeouts, etc.)
-5. Add all included tests to the traceability matrix (Section 8.4)
+| Pack | Domain | File |
+|------|--------|------|
+| `esp32` | ESP32 firmware (ESP-IDF / Arduino-ESP32): WiFi, BLE, MQTT, OTA, NVS, captive portal, watchdog, logging | `references/domains/esp32.md` |
 
-### Test Spec References
+### Adding a pack
 
-| File | Coverage |
-|------|----------|
-| [references/wifi-test-spec.md](references/wifi-test-spec.md) | WiFi STA connection, signal, DHCP, ethernet test mode |
-| [references/captive-portal-test-spec.md](references/captive-portal-test-spec.md) | AP mode, captive portal, provisioning, credential change |
-| [references/mqtt-test-spec.md](references/mqtt-test-spec.md) | Broker connection, pub/sub, QoS, LWT, reconnect, buffering |
-| [references/ble-test-spec.md](references/ble-test-spec.md) | BLE advertising, GATT, NUS, pairing, coexistence |
-| [references/ota-test-spec.md](references/ota-test-spec.md) | OTA download, rollback, integrity, power loss recovery |
-| [references/usb-hid-test-spec.md](references/usb-hid-test-spec.md) | USB enumeration, keyboard layouts, latency, stuck key prevention |
-| [references/nvs-test-spec.md](references/nvs-test-spec.md) | Config persistence, factory reset, corruption recovery, credentials |
-| [references/watchdog-test-spec.md](references/watchdog-test-spec.md) | Software/hardware WDT, memory watchdog, false trigger prevention |
-| [references/logging-test-spec.md](references/logging-test-spec.md) | Serial logging, UDP logging, log levels, crash capture |
+Create `references/domains/<domain>.md` following the same shape: **detection
+signals · layer profile (§2.4) · tier names (§8.0) · standard test libraries**
+(a feature-detection table pointing to spec files under
+`references/domains/<domain>/`). Then add a row to the table above.

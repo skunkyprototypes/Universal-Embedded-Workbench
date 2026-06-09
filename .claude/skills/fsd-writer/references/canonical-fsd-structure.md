@@ -29,6 +29,20 @@ All generated or updated FSDs must conform to this structure:
 - Persistence / storage
 - Update model (OTA, rollout strategy, etc.)
 
+### 2.4 Component Layering
+- A layered stack with a strict one-way dependency (each layer depends only on
+  layers below it): **L0 Foundation/platform** (shared infra we configure & use
+  but don't implement/test — SDK/library clients, managed services) → **L1
+  Interfaces** (external-facing modules whose wire/handler logic we own) → **L2
+  Application logic** (the project's own decision functions).
+- The L0-vs-L1 line is **ownership**: did we implement and test the protocol? A
+  library/managed client to an external service = foundation; a hand-written
+  decoder/driver/handler = interface.
+- Include a layered component diagram (stacked layer boxes, components on one row
+  per layer). Layer contents are platform-specific — see
+  `references/test-architecture.md` for profiles (embedded / cloud / mobile), the
+  diagram convention, the Mermaid layout gotcha, and the ASCII fallback.
+
 ## 3. Implementation Phases
 ### 3.1 Phase 1 — Infrastructure Foundation
 ### 3.2 Phase 2 — Core Functionality
@@ -78,6 +92,16 @@ Each phase includes:
 - Recovery procedures (factory reset, re-provisioning, safe-mode)
 
 ## 8. Verification & Validation
+### 8.0 Test Architecture
+- Test tiers = cost-ordered execution environments; name per platform (e.g.
+  embedded: host / target / bench; cloud: unit / integration / staging). Place
+  each behaviour at the **lowest tier where its bug can manifest**.
+- Map tiers to the §2.4 layers: L0 foundation tested **transitively**; L1
+  interfaces = pure core at the fast tier + wire/flow at higher tiers; L2
+  application logic = fast tier as pure functions.
+- Reference a **generated** component × tier coverage matrix (rows = §2.4
+  components by layer, columns = tiers). See `references/test-architecture.md`.
+
 ### 8.1 Phase 1 Verification
 | Test ID | Feature | Procedure | Success Criteria |
 |---------|---------|-----------|-----------------|
@@ -118,7 +142,8 @@ Each phase includes:
 
 Not every section applies to every project. The skill must:
 
-- **Always include**: Sections 1, 2, 3, 4, 5, 7, 8 (with traceability matrix)
+- **Always include**: Sections 1, 2 (with **2.4 Component Layering** + a layered
+  diagram), 3, 4, 5, 7, 8 (with **8.0 Test Architecture** and the traceability matrix)
 - **Include if applicable**: Section 6.4 (Commands/Opcodes) -- only for embedded or
   custom protocols
 - **Include if complexity >= Medium**: Section 9 (Troubleshooting), full Appendix
